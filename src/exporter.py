@@ -148,6 +148,13 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
             ["queue_name", *self.static_label_keys],
             registry=self.registry,
         )
+        self.celery_idle_process_count = Gauge(
+            f"{metric_prefix}idle_process_count",
+            # pylint: disable=line-too-long
+            f"The number of idle processes across workers consuming from a queue ({metric_prefix}active_process_count minus the tasks those workers are running).",
+            ["queue_name", *self.static_label_keys],
+            registry=self.registry,
+        )
 
     def scrape(self):
         if (
@@ -218,7 +225,19 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                     )
                     self.purge_worker_metrics(hostname)
 
-    def track_queue_metrics(self):
+    def _active_tasks(self, worker_name: str) -> int:
+        """
+        Number of tasks a worker is currently processing.
+
+        Workers we have not received a heartbeat from are reported as having no
+        active tasks, which matches the default of worker_tasks_active.
+        """
+        worker_state = self.state.workers.get(worker_name)
+        if worker_state is None:
+            return 0
+        return worker_state.active or 0
+
+    def track_queue_metrics(self):  # pylint: disable=too-many-locals
         with self.app.connection() as connection:  # type: ignore
             transport = connection.info()["transport"]
             acceptable_transports = [
@@ -235,12 +254,23 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                 )
                 return
 
-            concurrency_per_worker = {
-                worker: len(stats["pool"].get("processes", []))
-                for worker, stats in (self.app.control.inspect().stats() or {}).items()
+            concurrency_per_worker = {}
+            for worker, stats in (self.app.control.inspect().stats() or {}).items():
+                pool = stats["pool"]
+                processes = pool.get("processes")
+                if processes is not None:
+                    concurrency_per_worker[worker] = len(processes)
+                else:
+                    # Fall back to "max-concurrency" for pool implementations that do
+                    # not populate the "processes" key (e.g., gevent, eventlet).
+                    concurrency_per_worker[worker] = pool.get("max-concurrency") or 0
+            idle_per_worker = {
+                worker: max(0, processes - self._active_tasks(worker))
+                for worker, processes in concurrency_per_worker.items()
             }
             processes_per_queue = defaultdict(int)
             workers_per_queue = defaultdict(int)
+            idle_per_queue = defaultdict(int)
 
             # request workers to response active queues
             # we need to cache queue info in exporter in case all workers are offline
@@ -252,6 +282,7 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                     self.queue_cache.add(name)
                     workers_per_queue[name] += 1
                     processes_per_queue[name] += concurrency_per_worker.get(worker, 0)
+                    idle_per_queue[name] += idle_per_worker.get(worker, 0)
 
             for queue in self.queue_cache:
                 if transport in ["amqp", "amqps", "memory"]:
@@ -266,6 +297,9 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                 self.celery_active_worker_count.labels(
                     queue_name=queue, **self.static_label
                 ).set(workers_per_queue[queue])
+                self.celery_idle_process_count.labels(
+                    queue_name=queue, **self.static_label
+                ).set(idle_per_queue[queue])
                 length = queue_length(transport, connection, queue)
                 if length is not None:
                     self.celery_queue_length.labels(

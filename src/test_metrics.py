@@ -1,5 +1,6 @@
 import logging
 import time
+from typing import NamedTuple
 
 import pytest
 from celery.contrib.testing.worker import start_worker  # type: ignore
@@ -339,3 +340,203 @@ def test_worker_generic_task_hostname(threaded_exporter, celery_app, hostname):
             )
             is None
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for celery_idle_process_count
+# ---------------------------------------------------------------------------
+
+
+def _make_heartbeat_event(hostname, active_tasks):
+    """Build a worker-heartbeat event dict.
+
+    Mirrors the fields a real worker sends. Note there is no "pool" key: pool
+    sizes are only ever known from inspect().stats(), never from an event.
+    """
+    now = time.time()
+    return {
+        "type": "worker-heartbeat",
+        "hostname": hostname,
+        "timestamp": now,
+        "local_received": now,
+        "utcoffset": 0,
+        "active": active_tasks,
+        "processed": 0,
+        "loadavg": [0.0, 0.0, 0.0],
+        "freq": 2.0,
+        "sw_ident": "py-celery",
+        "sw_ver": "5.0",
+        "sw_sys": "Linux",
+        "clock": 1,
+        "pid": 1234,
+    }
+
+
+class WorkerSpec(NamedTuple):
+    """A worker as reported by inspect(), plus the state of its last heartbeat."""
+
+    name: str = "celery@host-1"
+    #: Pool processes in inspect().stats(). None for pools that report none.
+    processes: int | None = 4
+    #: Reported by gevent/eventlet/threads pools in place of "processes".
+    max_concurrency: int | None = None
+    #: Active tasks in the worker's last heartbeat. None if it never sent one.
+    active: int | None = 0
+    queues: tuple[str, ...] = ("default",)
+
+    @property
+    def pool_stats(self):
+        if self.processes is not None:
+            return {"processes": list(range(self.processes))}
+        return {
+            "implementation": "celery.concurrency.gevent:TaskPool",
+            "max-concurrency": self.max_concurrency,
+        }
+
+
+@pytest.fixture
+def scrape_queue_metrics(mocker, celery_app):
+    """Run track_queue_metrics() for the given workers against a stubbed broker.
+
+    Workers listed in ``offline`` send a heartbeat and then go offline, so they
+    are forgotten and no longer answer inspect().
+    """
+
+    def scrape(*workers, offline=()):
+        exporter = Exporter()
+        exporter.app = celery_app
+        exporter.state = celery_app.events.State()
+
+        for worker in (*offline, *workers):
+            if worker.active is not None:
+                exporter.track_worker_heartbeat(
+                    _make_heartbeat_event(worker.name, worker.active)
+                )
+        for worker in offline:
+            exporter.track_worker_status(
+                _make_heartbeat_event(worker.name, worker.active), is_online=False
+            )
+
+        # Stub the inspect calls so track_queue_metrics needs no live workers
+        mocker.patch.object(
+            exporter.app.control,
+            "inspect",
+            return_value=mocker.MagicMock(
+                stats=mocker.MagicMock(
+                    return_value={w.name: {"pool": w.pool_stats} for w in workers}
+                ),
+                active_queues=mocker.MagicMock(
+                    return_value={
+                        w.name: [{"name": q} for q in w.queues] for w in workers
+                    }
+                ),
+            ),
+        )
+        mocker.patch("src.exporter.queue_length", return_value=0)
+        mocker.patch("src.exporter.rabbitmq_queue_consumer_count", return_value=1)
+
+        with celery_app.connection() as conn:
+            mocker.patch.object(exporter.app, "connection", return_value=conn)
+            mocker.patch.object(conn, "info", return_value={"transport": "memory"})
+            exporter.track_queue_metrics()
+
+        return exporter
+
+    return scrape
+
+
+def _queue_gauge(exporter, metric, queue):
+    return exporter.registry.get_sample_value(metric, labels={"queue_name": queue})
+
+
+@pytest.mark.parametrize(
+    "workers,expected_idle",
+    [
+        pytest.param(
+            (WorkerSpec(processes=4, active=2),),
+            {"default": 2.0},
+            id="single-worker",
+        ),
+        pytest.param(
+            (WorkerSpec(processes=4, active=0),),
+            {"default": 4.0},
+            id="no-active-tasks",
+        ),
+        pytest.param(
+            (WorkerSpec(processes=4, active=4),),
+            {"default": 0.0},
+            id="fully-busy",
+        ),
+        # Active tasks can outnumber the pool size the scrape sees, e.g. after a
+        # worker shrinks its pool. Idle is clamped at 0 rather than going negative.
+        pytest.param(
+            (WorkerSpec(processes=4, active=6),),
+            {"default": 0.0},
+            id="more-active-tasks-than-processes",
+        ),
+        # No heartbeat means the worker is absent from the event state, so its
+        # active count reads 0, matching the worker_tasks_active default.
+        pytest.param(
+            (WorkerSpec(processes=3, active=None),),
+            {"default": 3.0},
+            id="no-heartbeat-yet",
+        ),
+        pytest.param(
+            (
+                WorkerSpec("celery@host-a", processes=4, active=1),
+                WorkerSpec("celery@host-b", processes=2, active=2),
+            ),
+            {"default": 3.0},
+            id="two-workers-one-queue",
+        ),
+        # celery@host-1 and gen2@host-1 collapse into a single worker_tasks_active
+        # series because the hostname label is stripped by get_hostname(). Active
+        # counts must therefore be read per worker from the event state, giving
+        # 3 + 1 idle rather than the same value counted twice.
+        pytest.param(
+            (
+                WorkerSpec("celery@host-1", processes=4, active=1),
+                WorkerSpec("gen2@host-1", processes=4, active=3),
+            ),
+            {"default": 4.0},
+            id="two-workers-same-host",
+        ),
+        pytest.param(
+            (WorkerSpec(processes=4, active=1, queues=("default", "priority")),),
+            {"default": 3.0, "priority": 3.0},
+            id="one-worker-two-queues",
+        ),
+        # gevent/eventlet/threads pools report no processes, so their configured
+        # max-concurrency stands in for the pool size.
+        pytest.param(
+            (WorkerSpec(processes=None, max_concurrency=100, active=30),),
+            {"default": 70.0},
+            id="greenlet-pool-uses-max-concurrency",
+        ),
+    ],
+)
+def test_idle_process_count(scrape_queue_metrics, workers, expected_idle):
+    exporter = scrape_queue_metrics(*workers)
+
+    for queue, expected in expected_idle.items():
+        idle = _queue_gauge(exporter, "celery_idle_process_count", queue)
+        total = _queue_gauge(exporter, "celery_active_process_count", queue)
+        assert idle == expected
+        # Both gauges come from the same inspect().stats() snapshot, so the idle
+        # count can never exceed the queue's total process count.
+        assert idle <= total
+
+
+def test_idle_process_count_sibling_worker_offline(scrape_queue_metrics):
+    """A worker going offline must not affect a live sibling on the same host.
+
+    ``worker_last_seen`` is keyed by the bare hostname, so forgetting one worker
+    forgets the whole host. A busy worker that is still consuming must keep
+    reporting 0 idle processes rather than falling back to "everything idle".
+    """
+    exporter = scrape_queue_metrics(
+        WorkerSpec("gen2@host-1", processes=4, active=4),
+        offline=(WorkerSpec("celery@host-1", processes=4, active=4),),
+    )
+
+    assert _queue_gauge(exporter, "celery_idle_process_count", "default") == 0.0

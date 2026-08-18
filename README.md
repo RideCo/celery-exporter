@@ -177,7 +177,8 @@ celery_task_queue_wait_time_bucket | Histogram of the time tasks spend waiting i
 celery_queue_length | The number of message in broker queue | Gauge
 celery_active_consumer_count | The number of active consumer in broker queue **(Only work for [RabbitMQ and Qpid](https://qpid.apache.org/) broker, more details at [here](https://github.com/danihodovic/celery-exporter/pull/118#issuecomment-1169870481))** | Gauge
 celery_active_worker_count | The number of active workers in broker queue | Gauge
-celery_active_process_count | The number of active process in broker queue. Each worker may have more than one process. | Gauge
+celery_active_process_count | The number of active process in broker queue. Each worker may have more than one process. Pools that do not run tasks in OS processes (gevent, eventlet and threads) do not report any, so their configured `max-concurrency` is used instead and the value counts concurrency slots rather than processes. | Gauge
+celery_idle_process_count | The number of idle processes across workers consuming from a queue: `celery_active_process_count` minus the tasks those workers are currently running, so the same concurrency-slot caveat applies to gevent, eventlet and threads. A worker consuming multiple queues contributes its idle count to each queue. | Gauge
 
 Used in production at [https://findwork.dev](https://findwork.dev) and [https://django.wtf](https://django.wtf).
 

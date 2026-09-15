@@ -185,9 +185,10 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         )
         self.celery_idle_process_count = Gauge(
             f"{metric_prefix}idle_process_count",
-            # pylint: disable=line-too-long
-            f"The number of idle processes across workers consuming from a queue ({metric_prefix}active_process_count minus the tasks those workers are running).",
-            ["queue_name", *self.static_label_keys],
+            f"The number of idle processes across workers consuming from "
+            f"a queue ({metric_prefix}active_process_count minus the tasks "
+            f"those workers are running).",
+            ["queue_name", "autoscaling", *self.static_label_keys],
             registry=self.registry,
         )
 
@@ -371,7 +372,7 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                     queue_name=queue, **self.static_label
                 ).set(workers_per_queue[queue])
                 self.celery_idle_process_count.labels(
-                    queue_name=queue, **self.static_label
+                    queue_name=queue, autoscaling="yes", **self.static_label
                 ).set(idle_per_queue[queue])
                 length = queue_length(transport, connection, queue)
                 if length is not None:

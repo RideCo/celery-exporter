@@ -11,6 +11,7 @@ from celery.utils.time import adjust_timestamp, utcoffset  # type: ignore
 from src.exporter import Exporter, reverse_adjust_timestamp
 
 
+# pylint: disable=too-many-lines
 def track_event(exporter, event_type, task):
     exporter.state = SimpleNamespace(
         event=lambda _event: None,
@@ -669,7 +670,7 @@ class WorkerSpec(NamedTuple):
     #: Reported by gevent/eventlet/threads pools in place of "processes".
     max_concurrency: int | None = None
     #: Active tasks in the worker's last heartbeat. None if it never sent one.
-    active: int | None = 0
+    active_tasks: int | None = 0
     queues: tuple[str, ...] = ("default",)
 
     @property
@@ -696,13 +697,13 @@ def scrape_queue_metrics(mocker, celery_app):
         exporter.state = celery_app.events.State()
 
         for worker in (*offline, *workers):
-            if worker.active is not None:
+            if worker.active_tasks is not None:
                 exporter.track_worker_heartbeat(
-                    _make_heartbeat_event(worker.name, worker.active)
+                    _make_heartbeat_event(worker.name, worker.active_tasks)
                 )
         for worker in offline:
             exporter.track_worker_status(
-                _make_heartbeat_event(worker.name, worker.active), is_online=False
+                _make_heartbeat_event(worker.name, worker.active_tasks), is_online=False
             )
 
         # Stub the inspect calls so track_queue_metrics needs no live workers
@@ -733,46 +734,48 @@ def scrape_queue_metrics(mocker, celery_app):
     return scrape
 
 
-def _queue_gauge(exporter, metric, queue):
-    return exporter.registry.get_sample_value(metric, labels={"queue_name": queue})
+def _queue_gauge(exporter, metric, queue, **extra_labels):
+    return exporter.registry.get_sample_value(
+        metric, labels={"queue_name": queue, **extra_labels}
+    )
 
 
 @pytest.mark.parametrize(
     "workers,expected_idle",
     [
         pytest.param(
-            (WorkerSpec(processes=4, active=2),),
+            (WorkerSpec(processes=4, active_tasks=2),),
             {"default": 2.0},
             id="single-worker",
         ),
         pytest.param(
-            (WorkerSpec(processes=4, active=0),),
+            (WorkerSpec(processes=4, active_tasks=0),),
             {"default": 4.0},
             id="no-active-tasks",
         ),
         pytest.param(
-            (WorkerSpec(processes=4, active=4),),
+            (WorkerSpec(processes=4, active_tasks=4),),
             {"default": 0.0},
             id="fully-busy",
         ),
         # Active tasks can outnumber the pool size the scrape sees, e.g. after a
         # worker shrinks its pool. Idle is clamped at 0 rather than going negative.
         pytest.param(
-            (WorkerSpec(processes=4, active=6),),
+            (WorkerSpec(processes=4, active_tasks=6),),
             {"default": 0.0},
             id="more-active-tasks-than-processes",
         ),
         # No heartbeat means the worker is absent from the event state, so its
         # active count reads 0, matching the worker_tasks_active default.
         pytest.param(
-            (WorkerSpec(processes=3, active=None),),
+            (WorkerSpec(processes=3, active_tasks=None),),
             {"default": 3.0},
             id="no-heartbeat-yet",
         ),
         pytest.param(
             (
-                WorkerSpec("celery@host-a", processes=4, active=1),
-                WorkerSpec("celery@host-b", processes=2, active=2),
+                WorkerSpec("celery@host-a", processes=4, active_tasks=1),
+                WorkerSpec("celery@host-b", processes=2, active_tasks=2),
             ),
             {"default": 3.0},
             id="two-workers-one-queue",
@@ -783,21 +786,21 @@ def _queue_gauge(exporter, metric, queue):
         # 3 + 1 idle rather than the same value counted twice.
         pytest.param(
             (
-                WorkerSpec("celery@host-1", processes=4, active=1),
-                WorkerSpec("gen2@host-1", processes=4, active=3),
+                WorkerSpec("celery@host-1", processes=4, active_tasks=1),
+                WorkerSpec("gen2@host-1", processes=4, active_tasks=3),
             ),
             {"default": 4.0},
             id="two-workers-same-host",
         ),
         pytest.param(
-            (WorkerSpec(processes=4, active=1, queues=("default", "priority")),),
+            (WorkerSpec(processes=4, active_tasks=1, queues=("default", "priority")),),
             {"default": 3.0, "priority": 3.0},
             id="one-worker-two-queues",
         ),
         # gevent/eventlet/threads pools report no processes, so their configured
         # max-concurrency stands in for the pool size.
         pytest.param(
-            (WorkerSpec(processes=None, max_concurrency=100, active=30),),
+            (WorkerSpec(processes=None, max_concurrency=100, active_tasks=30),),
             {"default": 70.0},
             id="greenlet-pool-uses-max-concurrency",
         ),
@@ -807,7 +810,9 @@ def test_idle_process_count(scrape_queue_metrics, workers, expected_idle):
     exporter = scrape_queue_metrics(*workers)
 
     for queue, expected in expected_idle.items():
-        idle = _queue_gauge(exporter, "celery_idle_process_count", queue)
+        idle = _queue_gauge(
+            exporter, "celery_idle_process_count", queue, autoscaling="yes"
+        )
         total = _queue_gauge(exporter, "celery_active_process_count", queue)
         assert idle == expected
         # Both gauges come from the same inspect().stats() snapshot, so the idle
@@ -823,11 +828,48 @@ def test_idle_process_count_sibling_worker_offline(scrape_queue_metrics):
     reporting 0 idle processes rather than falling back to "everything idle".
     """
     exporter = scrape_queue_metrics(
-        WorkerSpec("gen2@host-1", processes=4, active=4),
-        offline=(WorkerSpec("celery@host-1", processes=4, active=4),),
+        WorkerSpec("gen2@host-1", processes=4, active_tasks=4),
+        offline=(WorkerSpec("celery@host-1", processes=4, active_tasks=4),),
     )
 
-    assert _queue_gauge(exporter, "celery_idle_process_count", "default") == 0.0
+    assert (
+        _queue_gauge(
+            exporter, "celery_idle_process_count", "default", autoscaling="yes"
+        )
+        == 0.0
+    )
+
+
+def test_idle_process_count_autoscaling_label(scrape_queue_metrics):
+    """The autoscaling label lets downstream processors filter on this metric alone."""
+    exporter = scrape_queue_metrics(
+        WorkerSpec("gen2@host-1", processes=4, active_tasks=3)
+    )
+
+    # The autoscaling label is set on the celery_idle_process_count metric.
+    assert (
+        exporter.registry.get_sample_value(
+            "celery_idle_process_count",
+            labels={"queue_name": "default", "autoscaling": "yes"},
+        )
+        == 1.0
+    )
+    # The autoscaling label is not set on the celery_active_process_count metric.
+    assert (
+        exporter.registry.get_sample_value(
+            "celery_active_process_count",
+            labels={"queue_name": "default", "autoscaling": "yes"},
+        )
+        is None
+    )
+    # The celery_active_process_count metric has a value.
+    assert (
+        exporter.registry.get_sample_value(
+            "celery_active_process_count",
+            labels={"queue_name": "default"},
+        )
+        == 4.0
+    )
 
 
 QUEUE_WAIT_TASK_NAME = "src.test_metrics.waiting_task"
